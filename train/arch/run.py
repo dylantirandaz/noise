@@ -42,7 +42,8 @@ from torch.nn import functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # Track 3: the model is this folder's model.py, which entries may change; utils/eval.py scores it with --model.
 MODEL_FILE = Path(__file__).resolve().with_name('model.py')
-from model import GPT, GPTConfig, apply_rotary_emb, attention, copy_slots, flex, has_ve, norm, window_mask  # noqa: E402
+from model import (  # noqa: E402
+    GPT, GPTConfig, apply_rotary_emb, attention, copy_slots, flex, has_ve, norm, window_mask)
 from utils.prepare_data import TRAIN_ROWS, load_rows
 from utils.eval import evaluate
 
@@ -63,6 +64,11 @@ def planted_heads(spec):
         return [tuple(int(v) for v in item.split('.')) for item in str(spec).split(',') if item]
     except ValueError:
         raise ValueError(f'Planted heads are block.head pairs, not {spec!r}') from None
+
+
+def is_distinct_subset(codes, allowed):
+    """Whether `codes` lists some of the `allowed` characters, each at most once."""
+    return set(codes) <= set(allowed) and len(set(codes)) == len(codes)
 
 
 @dataclass
@@ -147,27 +153,10 @@ class Settings:
 
     def __post_init__(self):
         width, hidden = self.model.n_embd, 4 * self.model.n_embd
-        if self.model.copy_sources and (self.estimator != 'cut' or self.switch or not self.head_moments):
-            raise ValueError('The copy route is credited by Cut alone (no Boost phase), with head_moments')
-        if set(self.anvil_head_polar) - set('qk') or len(set(self.anvil_head_polar)) != len(self.anvil_head_polar):
-            raise ValueError("Per-head polar takes '', 'q', 'k' or 'qk'")
-        if set(self.precondition) - set('hp') or len(set(self.precondition)) != len(self.precondition):
-            raise ValueError("Preconditioning takes '', 'h', 'p' or 'hp'")
-        if not (0 <= self.precondition_beta < 1 and self.precondition_damping > 0):
-            raise ValueError('Preconditioning needs beta in [0,1) and a positive damping')
-        self.step_search = tuple(float(m) for m in self.step_search)
-        if any(m <= 0 for m in self.step_search) or len(set(self.step_search)) != len(self.step_search):
-            raise ValueError('Step multipliers must be distinct and positive')
-        heads = planted_heads(self.plant)
-        if len(set(heads)) != len(heads) or any(
-                not (0 <= block < self.model.n_layer and 0 <= head < self.model.n_head) for block, head in heads):
-            raise ValueError('Planted heads must be distinct block.head pairs of the model')
-        if heads and width // self.model.n_head // 2 <= len(PREV_PROFILE):
-            raise ValueError('Planted heads need more rotary frequencies than the planted profile lists')
-        if type(self.distill) is not bool or (self.distill and not (
-                0 <= self.distill_lam <= 1 and 0 < self.distill_beta < 1 and 0 <= self.distill_start < 1
-                and self.head_moments and self.estimator == 'cut')):
-            raise ValueError('Distillation needs Cut with head_moments, lam in [0,1], beta in (0,1), start in [0,1)')
+        self.check_copy_route()
+        self.check_optimizer_options()
+        self.check_planted_heads()
+        self.check_distillation()
         if self.chain_act not in ('fp32', 'bf16'):
             raise ValueError('Unknown chain activation dtype')
         if self.emb_credit not in ('chain', 'mid0'):
@@ -207,6 +196,39 @@ class Settings:
         if any(v <= 0 for v in (self.nrep, self.emb_chunk, self.chain_tokens, self.key_chunk, self.chunk,
                                self.sigma, self.fc_sigma, self.chain_sigma, self.key_sigma, self.scalar_step)):
             raise ValueError('Probe sizes and batching limits must be positive')
+
+    def check_copy_route(self):
+        if self.model.copy_sources and (self.estimator != 'cut' or self.switch or not self.head_moments):
+            raise ValueError('The copy route is credited by Cut alone (no Boost phase), with head_moments')
+
+    def check_optimizer_options(self):
+        if not is_distinct_subset(self.anvil_head_polar, 'qk'):
+            raise ValueError("Per-head polar takes '', 'q', 'k' or 'qk'")
+        if not is_distinct_subset(self.precondition, 'hp'):
+            raise ValueError("Preconditioning takes '', 'h', 'p' or 'hp'")
+        if not (0 <= self.precondition_beta < 1 and self.precondition_damping > 0):
+            raise ValueError('Preconditioning needs beta in [0,1) and a positive damping')
+        self.step_search = tuple(float(m) for m in self.step_search)
+        if any(m <= 0 for m in self.step_search) or len(set(self.step_search)) != len(self.step_search):
+            raise ValueError('Step multipliers must be distinct and positive')
+
+    def check_planted_heads(self):
+        heads = planted_heads(self.plant)
+        in_model = all(0 <= block < self.model.n_layer and 0 <= head < self.model.n_head for block, head in heads)
+        if len(set(heads)) != len(heads) or not in_model:
+            raise ValueError('Planted heads must be distinct block.head pairs of the model')
+        rotary_frequencies = self.model.n_embd // self.model.n_head // 2
+        if heads and rotary_frequencies <= len(PREV_PROFILE):
+            raise ValueError('Planted heads need more rotary frequencies than the planted profile lists')
+
+    def check_distillation(self):
+        if type(self.distill) is not bool:
+            raise ValueError('distill is True or False')
+        if not self.distill:
+            return
+        in_range = 0 <= self.distill_lam <= 1 and 0 < self.distill_beta < 1 and 0 <= self.distill_start < 1
+        if not (in_range and self.head_moments and self.estimator == 'cut'):
+            raise ValueError('Distillation needs Cut with head_moments, lam in [0,1], beta in (0,1), start in [0,1)')
 
     @property
     def chain_dtype(self):
@@ -300,22 +322,30 @@ def frozen_attention(q, k_own, v_own, k_clean, v_clean, window):
 
 frozen_attention_compiled = torch.compile(frozen_attention)
 
+def cycle_logits(base, C, y, steps, sq, dots, dir_sq, width, offset):
+    """Raw logits of cycle_derivatives' probes, before the soft cap: (z0, zy0, z, zy), every logit and the label's,
+    of the clean stream (n, V), (n, 1) and of the stream moved along each direction (n, P, V), (n, P)."""
+    target = y.clamp(min=0)
+    base_y = base.gather(1, target.unsqueeze(1))
+    dirs_y = C.T[target]
+    clean_inv = torch.rsqrt(sq / width + EPS)
+    moved_inv = torch.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
+    z0, zy0 = base * clean_inv, base_y * clean_inv
+    z = (base.unsqueeze(1) + steps.unsqueeze(-1) * C) * moved_inv.unsqueeze(-1)
+    zy = (base_y + steps * dirs_y) * moved_inv
+    if offset is None:
+        return z0, zy0, z, zy
+    offset_y = offset.gather(1, target.unsqueeze(1))
+    return z0 + offset, zy0 + offset_y, z + offset.unsqueeze(1), zy + offset_y
+
+
 @torch.compile(dynamic=False)
 def cycle_derivatives(base, C, y, steps, sq, dots, dir_sq, width, offset=None):
     """Forward differences of each token's readout loss along every direction D_j of a full cycle: base (n, V) W x of
     the clean streams; C (P, V) row j is W D_j; steps (n, 1); sq (n, 1) |x|^2; dots (n, P) x . D_j; dir_sq (P,)
     |D_j|^2. The moved stream's RMS comes from these, so the head's norm is evaluated exactly at every probe.
     offset (n, V): the copy route's fixed addition to each token's raw logits."""
-    target = y.clamp(min=0)
-    base_y = base.gather(1, target.unsqueeze(1))
-    dirs_y = C.T[target]
-    inv0 = torch.rsqrt(sq / width + EPS)
-    inv = torch.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
-    z0, zy0 = base * inv0, base_y * inv0
-    z, zy = (base.unsqueeze(1) + steps.unsqueeze(-1) * C) * inv.unsqueeze(-1), (base_y + steps * dirs_y) * inv
-    if offset is not None:
-        offset_y = offset.gather(1, target.unsqueeze(1))
-        z0, zy0, z, zy = z0 + offset, zy0 + offset_y, z + offset.unsqueeze(1), zy + offset_y
+    z0, zy0, z, zy = cycle_logits(base, C, y, steps, sq, dots, dir_sq, width, offset)
     clean = torch.exp(15 * torch.tanh(z0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(zy0 / 15)
     moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh(zy / 15)
     return (moved - clean) / steps * (y >= 0).unsqueeze(1)
@@ -339,16 +369,7 @@ def mixed_coordinate_differences(raw, y, sigma, q, lam):
 def mixed_cycle_derivatives(base, C, y, q, lam, steps, sq, dots, dir_sq, width, offset=None):
     """cycle_derivatives against the mixed target: the label's capped logit weighs 1 - lam and every capped logit v
     weighs lam q_v, clean and moved. q (n, V)."""
-    target = y.clamp(min=0)
-    base_y = base.gather(1, target.unsqueeze(1))
-    dirs_y = C.T[target]
-    inv0 = torch.rsqrt(sq / width + EPS)
-    inv = torch.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
-    z0, zy0 = base * inv0, base_y * inv0
-    z, zy = (base.unsqueeze(1) + steps.unsqueeze(-1) * C) * inv.unsqueeze(-1), (base_y + steps * dirs_y) * inv
-    if offset is not None:
-        offset_y = offset.gather(1, target.unsqueeze(1))
-        z0, zy0, z, zy = z0 + offset, zy0 + offset_y, z + offset.unsqueeze(1), zy + offset_y
+    z0, zy0, z, zy = cycle_logits(base, C, y, steps, sq, dots, dir_sq, width, offset)
     capped0, capped = 15 * torch.tanh(z0 / 15), 15 * torch.tanh(z / 15)
     clean = (torch.exp(capped0).sum(-1, keepdim=True).log() - (1 - lam) * 15 * torch.tanh(zy0 / 15)
              - lam * (q * capped0).sum(-1, keepdim=True))
@@ -934,8 +955,8 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
         target0 = base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 + offset_y
         target_change = 15 * torch.tanh(zy / 15) - 15 * torch.tanh(target0 / 15)
         if soft is not None:
-            lam, first, second = soft
-            teacher_change = a * second.unsqueeze(1) + inv * (d * first.unsqueeze(1)).sum(-1)
+            lam, teacher_first, teacher_second = soft
+            teacher_change = a * teacher_second.unsqueeze(1) + inv * (d * teacher_first.unsqueeze(1)).sum(-1)
             target_change = (1 - lam) * target_change + lam * teacher_change
         return (change - target_change) / scale * (y >= 0).unsqueeze(1)
     z = (base.unsqueeze(1) + (delta.to(torch.bfloat16) @ weight_t).float()) * inv.unsqueeze(-1)
@@ -1033,6 +1054,9 @@ def decode_key_pairs(scores, steps, rows):
     return decode_local_response(scores.sum(0).T, steps, rows) / len(rows)
 
 
+NORM_FLOOR = 1e-30  # keeps a zero credit from dividing by zero when it is rescaled
+
+
 class InputCovariance:
     """A running covariance of one linear map's inputs, and its damped inverse applied to that map's credit.
 
@@ -1056,11 +1080,12 @@ class InputCovariance:
 
     def apply(self, credit):
         """credit (outputs, width) times the damped inverse covariance, rescaled to the credit's own norm."""
+        credit = credit.float()
         covariance = self.mean / self.weight
-        damped = covariance + self.damping * covariance.diagonal().mean() * torch.eye(
-            len(covariance), device=covariance.device)
-        solved = torch.cholesky_solve(credit.float().T, torch.linalg.cholesky(damped)).T
-        return solved * (credit.float().norm() / solved.norm().clamp_min(1e-30))
+        identity = torch.eye(len(covariance), device=covariance.device)
+        damped = covariance + self.damping * covariance.diagonal().mean() * identity
+        solved = torch.cholesky_solve(credit.T, torch.linalg.cholesky(damped)).T
+        return solved * (credit.norm() / solved.norm().clamp_min(NORM_FLOOR))
 
 
 class Capture:
@@ -1223,12 +1248,16 @@ class Boost:
         C, stream_dirs, dir_sq, Hs = C[lo:hi].contiguous(), stream_dirs[:, lo:hi], dir_sq[lo:hi], H[lo:hi]
         per = max(1, self.s.chunk // ((hi - lo) * vocab))
         for t0 in range(0, n, per):
-            xs, ys = x[t0:t0 + per], y[t0:t0 + per]
-            cycle = (xs @ weight.T, C, ys) if soft is None else (xs @ weight.T, C, ys, soft[0][t0:t0 + per], soft[1])
-            derivative = (cycle_derivatives if soft is None else mixed_cycle_derivatives)(
-                *cycle, steps[t0:t0 + per], xs.square().sum(-1, keepdim=True), xs @ stream_dirs, dir_sq, self.width,
-                None if logit_offset is None else logit_offset[t0:t0 + per])
-            credit[t0:t0 + per] = derivative @ Hs / self.width
+            chunk = slice(t0, t0 + per)
+            xs, ys = x[chunk], y[chunk]
+            geometry = (steps[chunk], xs.square().sum(-1, keepdim=True), xs @ stream_dirs, dir_sq, self.width,
+                        None if logit_offset is None else logit_offset[chunk])
+            if soft is None:
+                derivative = cycle_derivatives(xs @ weight.T, C, ys, *geometry)
+            else:
+                teacher, lam = soft
+                derivative = mixed_cycle_derivatives(xs @ weight.T, C, ys, teacher[chunk], lam, *geometry)
+            credit[chunk] = derivative @ Hs / self.width
         return self.group_sum(credit)
 
     def embedding_block0(self, e, y, x):
@@ -1563,15 +1592,15 @@ class Boost:
     def precondition(self):
         """Settings.precondition: the all-reduced credits of the LM head and of the n-gram projections, each times
         the inverse running covariance of the inputs this update's clean forward gave them."""
-        model, inputs = self.model, self.capture.inputs
-        sites = {'h': ('lm_head', [model.lm_head.weight]),
-                 'p': ('ngram_proj.0', [proj.weight for proj in model.ngram_proj.values()]
-                       if model.config.ngram_rows else [])}
+        model = self.model
+        projections = [proj.weight for proj in model.ngram_proj.values()] if model.config.ngram_rows else []
+        # Per code: the captured input its weights read (the projections all read the same summed rows).
+        sites = {'h': ('lm_head', [model.lm_head.weight]), 'p': ('ngram_proj.0', projections)}
         for code, covariance in self.covariances.items():
             site, weights = sites[code]
             if not weights:
                 continue
-            covariance.update(inputs[site].flatten(0, 1))  # every projection reads the same summed rows
+            covariance.update(self.capture.inputs[site].flatten(0, 1))
             for weight in weights:
                 weight.grad = covariance.apply(weight.grad).to(weight.dtype)
 
@@ -1929,7 +1958,8 @@ class Cut(Boost):
             top = self.select_mlp_routes(i, mid, hpre, r)
             out = mid + F.linear(r, mlp.c_proj.weight.float())
             mids.append(mid), outs.append(out), routes.append((top, hpre.gather(1, top)))
-        g_top = self.probe(outs[-1], yf, soft=soft_rows, logit_offset=offset)  # the top stream's credit, through the head alone
+        # The top stream's credit, through the head alone.
+        g_top = self.probe(outs[-1], yf, soft=soft_rows, logit_offset=offset)
         chain = self.chain_credits(e, x0, mids, outs, routes, yf, soft_rows, offset)
         lam_r = model.resid_lambdas.float()
         outputs = {i: g_top if i == L - 1 else lam_r[i + 1] * chain[i + 1] for i in range(L)}  # block output credits
@@ -2694,8 +2724,9 @@ def previous_token_pair(head_dim, generator):
     theta = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)
     phase = torch.rand(half, generator=generator) * 2 * math.pi
     q1, q2 = amplitude * torch.cos(phase), amplitude * torch.sin(phase)
+    turn_cos, turn_sin = torch.cos(theta), torch.sin(theta)  # one position's rotation at each frequency
     q = torch.cat([q1, q2])
-    k = torch.cat([torch.cos(theta) * q1 + torch.sin(theta) * q2, -torch.sin(theta) * q1 + torch.cos(theta) * q2])
+    k = torch.cat([turn_cos * q1 + turn_sin * q2, -turn_sin * q1 + turn_cos * q2])
     return q, k
 
 
@@ -2724,7 +2755,7 @@ def plant_previous_token_heads(model, heads, rows, seed):
         direction = attention_input(model, rows, block).mean(0)
         direction = direction / direction.norm()
         own_rows = slice(head * attn.head_dim, (head + 1) * attn.head_dim)
-        for linear, vector in zip((attn.c_q, attn.c_k), previous_token_pair(attn.head_dim, generator)):
+        for linear, vector in zip((attn.c_q, attn.c_k), previous_token_pair(attn.head_dim, generator), strict=True):
             linear.weight[own_rows] = torch.outer(vector.to(direction.device), direction).to(linear.weight.dtype)
             planted.append(linear.weight)
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
@@ -2744,7 +2775,7 @@ class Teacher:
 
     @torch.no_grad()
     def update(self, model):
-        for mean, own, new in zip(self.means, self.net.parameters(), model.parameters()):
+        for mean, own, new in zip(self.means, self.net.parameters(), model.parameters(), strict=True):
             if mean is None:
                 own.lerp_(new, 1 - self.beta)
             else:
@@ -2904,7 +2935,7 @@ def search_step(model, before, multipliers, rows, rank, world):
     after = [p.detach().clone() for p in model.parameters()]
 
     def place(multiplier):
-        for p, old, new in zip(model.parameters(), before, after):
+        for p, old, new in zip(model.parameters(), before, after, strict=True):
             p.copy_(new if multiplier == 1 else torch.lerp(old.float(), new.float(), multiplier).to(p.dtype))
 
     losses = {}
@@ -3182,13 +3213,14 @@ def train_stages(args, settings, device, rank, world):
                 optimizer, estimator, phase = next_optimizer, estimator_for(model, current), current
             batch = rank_slice(training[begin:end], phase)
             set_rate(optimizer, phase_step, horizon, settings.warmdown, settings.final)
+            inputs, targets = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
             distilled = teacher is not None and phase == 'cut' and begin / len(training) >= settings.distill_start
-            estimator.soft = ((teacher.distribution(batch[:, :-1].contiguous()), settings.distill_lam)
-                              if distilled else None)
+            estimator.soft = (teacher.distribution(inputs), settings.distill_lam) if distilled else None
             before = [p.detach().clone() for p in model.parameters()] if settings.step_search else None
-            loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
-            step_scale = (search_step(model, before, settings.step_search, holdout_rows, rank, world)
-                          if settings.step_search else None)
+            loss = estimator.step(inputs, targets, optimizer)
+            step_scale = None
+            if settings.step_search:
+                step_scale = search_step(model, before, settings.step_search, holdout_rows, rank, world)
             del before
             if teacher is not None:
                 teacher.update(model)

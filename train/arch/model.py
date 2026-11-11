@@ -7,6 +7,7 @@ utils/eval.py builds it that way.
 """
 from dataclasses import dataclass
 from functools import cache
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -56,19 +57,29 @@ class GPTConfig:
 
 
 NGRAM_SKIPS = {'s': (2,), 't': (3,), 'u': (2, 3)}  # skip-gram codes: the token with the tokens that many back
-# Context codes look a position's suffix up earlier in its own sequence and name the token that followed it. Each has
-# reliability buckets; its table has one row per (bucket, token) and one per bucket for "no earlier occurrence", so
-# nothing is hashed. Per code: (suffix length, kind, buckets).
-#   'latest'  a b c   the token after the most recent earlier occurrence
-#   'agree'   A B C   the same token, bucketed by the occurrence before that: none, same continuation, another one
-#   'second'  x y z   the token after the second most recent earlier occurrence
-#   'longest' m       the token after the most recent occurrence of the longest matching suffix, bucketed by its length
+HASH_MULTIPLIER = 2654435761  # Knuth's multiplicative hash constant
+
+
+class ContextCode(NamedTuple):
+    """One way to look a position's suffix up earlier in its own sequence and name the token that followed it."""
+    suffix: int  # tokens in the suffix that must match
+    kind: str  # which earlier occurrence is read, and how its reliability is bucketed (below)
+    buckets: int  # reliability buckets; the code's table has one row per (bucket, token), so nothing is hashed
+
+
+# kind      codes   continuation token                                   bucket
+# 'latest'  a b c   after the most recent earlier occurrence             one
+# 'agree'   A B C   the same token                                       the one before it: none, agrees, differs
+# 'second'  x y z   after the second most recent earlier occurrence      one
+# 'longest' m       after the latest occurrence of the longest match     the length of that match
 LONGEST_SUFFIX = 5
+AGREE_BUCKETS = 3
 CONTEXT_CODES = {
-    'a': (1, 'latest', 1), 'b': (2, 'latest', 1), 'c': (3, 'latest', 1),
-    'A': (1, 'agree', 3), 'B': (2, 'agree', 3), 'C': (3, 'agree', 3),
-    'x': (1, 'second', 1), 'y': (2, 'second', 1), 'z': (3, 'second', 1),
-    'm': (LONGEST_SUFFIX, 'longest', LONGEST_SUFFIX),
+    'a': ContextCode(1, 'latest', 1), 'b': ContextCode(2, 'latest', 1), 'c': ContextCode(3, 'latest', 1),
+    'A': ContextCode(1, 'agree', AGREE_BUCKETS), 'B': ContextCode(2, 'agree', AGREE_BUCKETS),
+    'C': ContextCode(3, 'agree', AGREE_BUCKETS),
+    'x': ContextCode(1, 'second', 1), 'y': ContextCode(2, 'second', 1), 'z': ContextCode(3, 'second', 1),
+    'm': ContextCode(LONGEST_SUFFIX, 'longest', LONGEST_SUFFIX),
 }
 
 
@@ -102,28 +113,36 @@ def context_continuation(idx, n, pad):
     return context_continuations(idx, n, pad)[0]
 
 
-def context_lookup(idx, code, pad):
-    """(token, bucket) of a context code at each position: the continuation token it names (`pad`: none, bucket 0)
-    and that token's reliability bucket."""
-    n, kind, _ = CONTEXT_CODES[code]
-    if kind == 'latest':
-        token = context_continuation(idx, n, pad)
-        return token, torch.zeros_like(token)
-    if kind == 'second':
-        token = context_continuations(idx, n, pad, 2)[1]
-        return token, torch.zeros_like(token)
-    if kind == 'agree':
-        token, before = context_continuations(idx, n, pad, 2)
-        return token, torch.where(before == pad, 0, torch.where(before == token, 1, 2))
+def longest_continuation(idx, longest, pad):
+    """(token, bucket): the token after the most recent occurrence of the longest matching suffix of up to `longest`
+    tokens, and that suffix's length less one."""
     token, bucket = torch.full_like(idx, pad), torch.zeros_like(idx)
-    for length in range(1, n + 1):  # longer suffixes overwrite shorter ones
+    for length in range(1, longest + 1):  # longer suffixes overwrite shorter ones
         found = context_continuation(idx, length, pad)
-        token, bucket = torch.where(found != pad, found, token), torch.where(found != pad, length - 1, bucket)
+        matched = found != pad
+        token, bucket = torch.where(matched, found, token), torch.where(matched, length - 1, bucket)
     return token, bucket
 
 
+def context_lookup(idx, code, pad):
+    """(token, bucket) of a context code at each position: the continuation token it names (`pad`: none, bucket 0)
+    and that token's reliability bucket."""
+    suffix, kind, _ = CONTEXT_CODES[code]
+    if kind == 'longest':
+        return longest_continuation(idx, suffix, pad)
+    if kind == 'latest':
+        token = context_continuation(idx, suffix, pad)
+        return token, torch.zeros_like(token)
+    latest, before = context_continuations(idx, suffix, pad, depth=2)
+    if kind == 'second':
+        return before, torch.zeros_like(before)
+    no_earlier, agrees, differs = range(AGREE_BUCKETS)
+    return latest, torch.where(before == pad, no_earlier, torch.where(before == latest, agrees, differs))
+
+
 def context_rows(code, pad):
-    return CONTEXT_CODES[code][2] * (pad + 1)
+    """Rows of a context code's table: per bucket, one for every token and one for "no earlier occurrence"."""
+    return CONTEXT_CODES[code].buckets * (pad + 1)
 
 
 def ngram_index(idx, code, rows, pad, lookups=None):
@@ -133,7 +152,8 @@ def ngram_index(idx, code, rows, pad, lookups=None):
     if code in CONTEXT_CODES:
         token, bucket = lookups[code] if lookups else context_lookup(idx, code, pad)
         return bucket * (pad + 1) + token
-    h = suffix_ids(idx, NGRAM_SKIPS.get(code) or range(1, int(code)), pad) * 2654435761  # wraps in int64: still a fixed hash
+    lags = NGRAM_SKIPS.get(code) or range(1, int(code))
+    h = suffix_ids(idx, lags, pad) * HASH_MULTIPLIER  # wraps in int64 for long n-grams: still a fixed hash
     return (h ^ (h >> 29)).remainder(rows)
 
 
@@ -141,7 +161,8 @@ def copy_slots(sources):
     """First copy_gate entry of each copy source (its buckets follow it), and the number of entries in all."""
     slots, used = {}, 0
     for code in sources:
-        slots[code], used = used, used + CONTEXT_CODES[code][2]
+        slots[code] = used
+        used += CONTEXT_CODES[code].buckets
     return slots, used
 
 
@@ -320,13 +341,14 @@ class GPT(nn.Module):
         """The copy route's addition to the raw logits, [batch, token, vocab]: each source's gate for the token's
         bucket, at the logit of the continuation token it names."""
         vocab, pad = self.config.vocab_size, self.transformer.wte.num_embeddings
-        slots, _ = copy_slots(self.config.copy_sources)
-        offset = None
-        for code in self.config.copy_sources:
+        sources = self.config.copy_sources
+        slots, _ = copy_slots(sources)
+        gates = self.copy_gate.float()
+        any_token, _ = lookups[sources[0]]
+        offset = torch.zeros(*any_token.shape, vocab, device=any_token.device)
+        for code in sources:
             token, bucket = lookups[code]
-            amount = self.copy_gate.float()[slots[code] + bucket] * (token != pad)
-            if offset is None:
-                offset = torch.zeros(*token.shape, vocab, device=token.device)
+            amount = gates[slots[code] + bucket] * (token != pad)
             offset = offset.scatter_add(2, token.clamp(max=vocab - 1).unsqueeze(-1), amount.unsqueeze(-1))
         return offset
 
