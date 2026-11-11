@@ -42,7 +42,7 @@ from torch.nn import functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # Track 3: the model is this folder's model.py, which entries may change; utils/eval.py scores it with --model.
 MODEL_FILE = Path(__file__).resolve().with_name('model.py')
-from model import GPT, GPTConfig, apply_rotary_emb, attention, flex, has_ve, norm, window_mask  # noqa: E402
+from model import GPT, GPTConfig, apply_rotary_emb, attention, copy_slots, flex, has_ve, norm, window_mask  # noqa: E402
 from utils.prepare_data import TRAIN_ROWS, load_rows
 from utils.eval import evaluate
 
@@ -55,6 +55,14 @@ torch._dynamo.config.cache_size_limit = 64
 def model_config():
     """The architecture is model.py's: GPTConfig()'s defaults, as utils/eval.py builds it."""
     return GPTConfig()
+
+
+def planted_heads(spec):
+    """(block, head) pairs of Settings.plant: 'block.head' entries separated by commas."""
+    try:
+        return [tuple(int(v) for v in item.split('.')) for item in str(spec).split(',') if item]
+    except ValueError:
+        raise ValueError(f'Planted heads are block.head pairs, not {spec!r}') from None
 
 
 @dataclass
@@ -121,9 +129,45 @@ class Settings:
     emb_credit: str = 'mid0'  # 'mid0': the embedding's credit from block 0's measured one (no embedding chain root)
     chain_fast: bool = True  # routed own-query responses with one exponential per logit, their projection in bf16
     future_precision: str = 'tf32x3'  # the future scores' dot products ('tf32': one MMA, ~8e-4 relative)
+    anvil_head_polar: str = ''  # 'q', 'k' or 'qk': ANVIL's polar step for those attention matrices, taken per head
+    plant: str = ''  # 'block.head[,block.head]': those heads start as content-free previous-token heads (init only)
+    distill: bool = False  # Cut measures its losses against (1 - lam) the label + lam an EMA teacher's distribution
+    distill_lam: float = 0.3
+    distill_beta: float = 0.99  # the teacher's weights: this exponential mean of the model's, from the first update
+    distill_start: float = 0.1  # fraction of the epoch's rows before the first distilled update
+    copy_scale: float = 15.0  # Adam rate multiplier of the copy route's gates (model.copy_sources)
+    # 'h' (the LM head), 'p' (the n-gram projections): their credit is multiplied by the inverse of a running
+    # covariance of their inputs before Adam, so directions the inputs rarely take learn as fast as common ones
+    precondition: str = ''
+    precondition_beta: float = 0.95  # the running covariance's exponential mean
+    precondition_damping: float = 0.1  # added to the covariance, as a fraction of its mean diagonal
+    # Multipliers of each update tried by one forward each on the held-out rows (which feed no update); the lowest
+    # loss is kept. () applies the update as is.
+    step_search: tuple = ()
 
     def __post_init__(self):
         width, hidden = self.model.n_embd, 4 * self.model.n_embd
+        if self.model.copy_sources and (self.estimator != 'cut' or self.switch or not self.head_moments):
+            raise ValueError('The copy route is credited by Cut alone (no Boost phase), with head_moments')
+        if set(self.anvil_head_polar) - set('qk') or len(set(self.anvil_head_polar)) != len(self.anvil_head_polar):
+            raise ValueError("Per-head polar takes '', 'q', 'k' or 'qk'")
+        if set(self.precondition) - set('hp') or len(set(self.precondition)) != len(self.precondition):
+            raise ValueError("Preconditioning takes '', 'h', 'p' or 'hp'")
+        if not (0 <= self.precondition_beta < 1 and self.precondition_damping > 0):
+            raise ValueError('Preconditioning needs beta in [0,1) and a positive damping')
+        self.step_search = tuple(float(m) for m in self.step_search)
+        if any(m <= 0 for m in self.step_search) or len(set(self.step_search)) != len(self.step_search):
+            raise ValueError('Step multipliers must be distinct and positive')
+        heads = planted_heads(self.plant)
+        if len(set(heads)) != len(heads) or any(
+                not (0 <= block < self.model.n_layer and 0 <= head < self.model.n_head) for block, head in heads):
+            raise ValueError('Planted heads must be distinct block.head pairs of the model')
+        if heads and width // self.model.n_head // 2 <= len(PREV_PROFILE):
+            raise ValueError('Planted heads need more rotary frequencies than the planted profile lists')
+        if type(self.distill) is not bool or (self.distill and not (
+                0 <= self.distill_lam <= 1 and 0 < self.distill_beta < 1 and 0 <= self.distill_start < 1
+                and self.head_moments and self.estimator == 'cut')):
+            raise ValueError('Distillation needs Cut with head_moments, lam in [0,1], beta in (0,1), start in [0,1)')
         if self.chain_act not in ('fp32', 'bf16'):
             raise ValueError('Unknown chain activation dtype')
         if self.emb_credit not in ('chain', 'mid0'):
@@ -257,19 +301,71 @@ def frozen_attention(q, k_own, v_own, k_clean, v_clean, window):
 frozen_attention_compiled = torch.compile(frozen_attention)
 
 @torch.compile(dynamic=False)
-def cycle_derivatives(base, C, y, steps, sq, dots, dir_sq, width):
+def cycle_derivatives(base, C, y, steps, sq, dots, dir_sq, width, offset=None):
     """Forward differences of each token's readout loss along every direction D_j of a full cycle: base (n, V) W x of
     the clean streams; C (P, V) row j is W D_j; steps (n, 1); sq (n, 1) |x|^2; dots (n, P) x . D_j; dir_sq (P,)
-    |D_j|^2. The moved stream's RMS comes from these, so the head's norm is evaluated exactly at every probe."""
+    |D_j|^2. The moved stream's RMS comes from these, so the head's norm is evaluated exactly at every probe.
+    offset (n, V): the copy route's fixed addition to each token's raw logits."""
     target = y.clamp(min=0)
     base_y = base.gather(1, target.unsqueeze(1))
     dirs_y = C.T[target]
     inv0 = torch.rsqrt(sq / width + EPS)
-    clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(base_y * inv0 / 15)
     inv = torch.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
-    z = (base.unsqueeze(1) + steps.unsqueeze(-1) * C) * inv.unsqueeze(-1)
-    moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh((base_y + steps * dirs_y) * inv / 15)
+    z0, zy0 = base * inv0, base_y * inv0
+    z, zy = (base.unsqueeze(1) + steps.unsqueeze(-1) * C) * inv.unsqueeze(-1), (base_y + steps * dirs_y) * inv
+    if offset is not None:
+        offset_y = offset.gather(1, target.unsqueeze(1))
+        z0, zy0, z, zy = z0 + offset, zy0 + offset_y, z + offset.unsqueeze(1), zy + offset_y
+    clean = torch.exp(15 * torch.tanh(z0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(zy0 / 15)
+    moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh(zy / 15)
     return (moved - clean) / steps * (y >= 0).unsqueeze(1)
+
+
+@torch.compile
+def mixed_coordinate_differences(raw, y, sigma, q, lam):
+    """coordinate_differences against the mixed target (1 - lam) one-hot(y) + lam q: logit v's target term is its
+    target weight times its capped change. raw, q [..., V]; y [...]."""
+    cap = lambda v: 15 * torch.tanh(v / 15)
+    z, up, down = cap(raw.float()), cap(raw.float() + sigma), cap(raw.float() - sigma)
+    weight = torch.softmax(z, -1)
+    moved_loss = lambda new: torch.log1p(weight * torch.expm1(new - z))
+    change = moved_loss(up) - moved_loss(down)
+    target = y.clamp(min=0).unsqueeze(-1)
+    change = change.scatter_add(-1, target, -(1 - lam) * (up - down).gather(-1, target)) - lam * q * (up - down)
+    return change / (2 * sigma) * (y >= 0).unsqueeze(-1)
+
+
+@torch.compile(dynamic=False)
+def mixed_cycle_derivatives(base, C, y, q, lam, steps, sq, dots, dir_sq, width, offset=None):
+    """cycle_derivatives against the mixed target: the label's capped logit weighs 1 - lam and every capped logit v
+    weighs lam q_v, clean and moved. q (n, V)."""
+    target = y.clamp(min=0)
+    base_y = base.gather(1, target.unsqueeze(1))
+    dirs_y = C.T[target]
+    inv0 = torch.rsqrt(sq / width + EPS)
+    inv = torch.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
+    z0, zy0 = base * inv0, base_y * inv0
+    z, zy = (base.unsqueeze(1) + steps.unsqueeze(-1) * C) * inv.unsqueeze(-1), (base_y + steps * dirs_y) * inv
+    if offset is not None:
+        offset_y = offset.gather(1, target.unsqueeze(1))
+        z0, zy0, z, zy = z0 + offset, zy0 + offset_y, z + offset.unsqueeze(1), zy + offset_y
+    capped0, capped = 15 * torch.tanh(z0 / 15), 15 * torch.tanh(z / 15)
+    clean = (torch.exp(capped0).sum(-1, keepdim=True).log() - (1 - lam) * 15 * torch.tanh(zy0 / 15)
+             - lam * (q * capped0).sum(-1, keepdim=True))
+    moved = (torch.exp(capped).sum(-1).log() - (1 - lam) * 15 * torch.tanh(zy / 15)
+             - lam * (q.unsqueeze(1) * capped).sum(-1))
+    return (moved - clean) / steps * (y >= 0).unsqueeze(1)
+
+
+def teacher_head_rows(xL, base, weight, q, offset=None):
+    """Per token of the top stream, for the chain's mixed target: W^T (q f') and (q f') . base, with f' the soft cap's
+    slope at the clean logits. The teacher term sum_v q_v f(z_v) then changes by a * second + inv * first . delta
+    to first order in the logit change a * base + inv * (W delta)."""
+    inv0 = torch.rsqrt(xL.square().sum(-1, keepdim=True) / xL.shape[-1] + EPS)
+    clean = base * inv0 if offset is None else base * inv0 + offset
+    slope = q * (1 - torch.tanh(clean / 15).square())
+    return slope @ weight, (slope * base).sum(-1)
+
 
 @torch.compile(dynamic=False)
 def moved_heads(raw, a, sigma, cos, sin):
@@ -741,14 +837,15 @@ def moment_matrices(w16, c16):
 MOMENT_KERNEL = False  # set from Settings.moment_kernel
 
 
-def head_moments(xL, base, weight, block=64):
+def head_moments(xL, base, weight, block=64, offset=None):
     """Per-token moments of the softcapped readout for head_moments: with z0 = base * inv0, f = 15 tanh(z / 15) and
     p = softmax(f(z0)), the change of log sum exp f(z0 + dz) for dz = a * base + inv * (W delta) is, to second order,
     lin + a^2 B2 + 2 a inv nu.delta + inv^2 delta^T M delta - lin^2 / 2 with lin = a B1 + inv mu1.delta. Returns
-    (B1, B2, mu1, nu, M), M in bf16 (tokens, width, width)."""
+    (B1, B2, mu1, nu, M), M in bf16 (tokens, width, width). offset (tokens, V): the copy route's fixed addition to
+    the raw logits, so z0 = base * inv0 + offset (dz is unchanged: the offset does not move)."""
     width = xL.shape[-1]
     inv0 = torch.rsqrt(xL.square().sum(-1, keepdim=True) / width + EPS)
-    t = torch.tanh(base * inv0 / 15)
+    t = torch.tanh((base * inv0 if offset is None else base * inv0 + offset) / 15)
     f, f1 = 15 * t, 1 - t.square()
     f2 = -(2 / 15) * t * f1
     prob = torch.softmax(f, -1)
@@ -766,7 +863,8 @@ def head_moments(xL, base, weight, block=64):
 
 
 def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
-                      target_logit_w, y, own=None, from_output=False, packed=False, moments=None):
+                      target_logit_w, y, own=None, from_output=False, packed=False, moments=None, soft=None,
+                      offset=None):
     """Forward differences of each token's loss along every move of one site, K/V held, MLPs restricted to
     each token's top-k units. site: -1 for the raw embedding, else the block whose mid stream moves. move (m, P, W);
     scale (m, P) the step each difference is divided by; e, x0, xL (m, W); mids per block (m, W); idx, hs per block
@@ -777,6 +875,8 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     the next block through BOTH its residual scaling and its own-query response.
     move may be (steps (m, 1), rows (P0, W), extra (m, P - P0, W) or None) (fused_moves): the moves steps * rows, then
     extra, formed here so the compiled graph never stores them in fp32.
+    soft (lam, first (m, W), second (m,)) from teacher_head_rows measures the loss against the mixed target instead
+    (with moments only). offset (m, V): the copy route's fixed addition to the raw logits.
     Returns (m, P)."""
     L = len(mids)
     if isinstance(move, tuple):
@@ -821,6 +921,8 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     inv = torch.rsqrt((sq + 2 * dots + delta.float().square().sum(-1)) / xL.shape[-1] + EPS)
     zy = (base.gather(1, y.clamp(min=0).unsqueeze(1)) + (delta * target_logit_w.unsqueeze(1)).sum(-1)) * inv
     inv0 = torch.rsqrt(sq / xL.shape[-1] + EPS)
+    offset_y = 0.0 if offset is None else offset.gather(1, y.clamp(min=0).unsqueeze(1))
+    zy = zy + offset_y
     if moments is not None:  # the partition function's change to second order in the logit change (head_moments)
         b1, b2, mu1, nu, second = moments
         a = inv - inv0
@@ -829,13 +931,20 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
         quad = (torch.bmm(delta.to(torch.bfloat16), second).float() * d).sum(-1)
         change = (lin + a.square() * b2.unsqueeze(1) + 2 * a * inv * (d * nu.unsqueeze(1)).sum(-1)
                   + inv.square() * quad - 0.5 * lin.square())
-        target0 = base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0
-        moved_minus_clean = change - (15 * torch.tanh(zy / 15) - 15 * torch.tanh(target0 / 15))
-        return moved_minus_clean / scale * (y >= 0).unsqueeze(1)
+        target0 = base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 + offset_y
+        target_change = 15 * torch.tanh(zy / 15) - 15 * torch.tanh(target0 / 15)
+        if soft is not None:
+            lam, first, second = soft
+            teacher_change = a * second.unsqueeze(1) + inv * (d * first.unsqueeze(1)).sum(-1)
+            target_change = (1 - lam) * target_change + lam * teacher_change
+        return (change - target_change) / scale * (y >= 0).unsqueeze(1)
     z = (base.unsqueeze(1) + (delta.to(torch.bfloat16) @ weight_t).float()) * inv.unsqueeze(-1)
+    z0 = base * inv0
+    if offset is not None:
+        z, z0 = z + offset.unsqueeze(1), z0 + offset
     moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh(zy / 15)
-    clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(
-        base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 / 15)
+    clean = torch.exp(15 * torch.tanh(z0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(
+        (base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 + offset_y) / 15)
     return (moved - clean) / scale * (y >= 0).unsqueeze(1)
 
 
@@ -924,6 +1033,36 @@ def decode_key_pairs(scores, steps, rows):
     return decode_local_response(scores.sum(0).T, steps, rows) / len(rows)
 
 
+class InputCovariance:
+    """A running covariance of one linear map's inputs, and its damped inverse applied to that map's credit.
+
+    The credit of a linear map is error^T input, so it is largest along the directions its inputs take most often.
+    Multiplying by the inverse input covariance (the input half of a Kronecker-factored curvature) gives every input
+    direction the step a least-squares solve would. Only forward activations enter it."""
+
+    def __init__(self, beta, damping):
+        self.beta, self.damping = beta, damping
+        self.mean, self.weight = None, 0.0
+
+    def update(self, inputs):
+        """inputs (rows, width) of this update on this rank; the ranks' sums are added so every replica agrees."""
+        x = inputs.float()
+        stats = torch.cat([(x.T @ x).flatten(), x.new_tensor([float(len(x))])])
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stats)
+        covariance = stats[:-1].view(x.shape[1], x.shape[1]) / stats[-1]
+        self.mean = covariance if self.mean is None else self.mean.lerp_(covariance, 1 - self.beta)
+        self.weight = self.beta * self.weight + 1 - self.beta if self.weight else 1.0
+
+    def apply(self, credit):
+        """credit (outputs, width) times the damped inverse covariance, rescaled to the credit's own norm."""
+        covariance = self.mean / self.weight
+        damped = covariance + self.damping * covariance.diagonal().mean() * torch.eye(
+            len(covariance), device=covariance.device)
+        solved = torch.cholesky_solve(credit.float().T, torch.linalg.cholesky(damped)).T
+        return solved * (credit.float().norm() / solved.norm().clamp_min(1e-30))
+
+
 class Capture:
     """The clean forward's cached activations, and the record's orthogonal draws and coordinate head."""
 
@@ -989,14 +1128,34 @@ class Capture:
             self.capturing = False
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == 'cuda'):
             self.x0 = norm(self.outputs['transformer.wte'])
+        # The copy route: each token's lookups, and what they add to its raw logits (fixed in every rerun).
+        copying = bool(self.model.config.copy_sources)
+        self.lookups = self.model.context_lookups(x) if copying else None
+        self.offset = self.model.copy_offset(self.lookups) if copying else None
         if self.model.config.ngram_rows:  # the value embedding every rerun reads: the table's row plus the n-gram's
             for i in self.model.value_embeds:
                 self.outputs[f'value_embeds.{i}'] = self.outputs[f'value_embeds.{i}'] + self.outputs[f'ngram_proj.{i}']
 
-    def head_error(self, sigma=0.1):
+    def head_error(self, sigma=0.1, soft=None):
         raw = self.outputs['lm_head'][..., :self.model.config.vocab_size]
-        error = coordinate_differences(raw, self.y, sigma)
+        if self.offset is not None:
+            raw = raw.float() + self.offset
+        error = (coordinate_differences(raw, self.y, sigma) if soft is None
+                 else mixed_coordinate_differences(raw, self.y, sigma, *soft))
         return F.pad(error, (0, self.outputs['lm_head'].shape[-1] - raw.shape[-1]))
+
+    def copy_credit(self, head):
+        """The copy gates' credit, exact: a gate adds to the raw logit of its continuation token wherever its bucket
+        fires, so its credit is the head's measured error at that logit, summed over those tokens."""
+        config = self.model.config
+        vocab, pad = config.vocab_size, self.model.transformer.wte.num_embeddings
+        slots, _ = copy_slots(config.copy_sources)
+        credit = torch.zeros_like(self.model.copy_gate, dtype=torch.float32)
+        for code in config.copy_sources:
+            token, bucket = self.lookups[code]
+            error = head[..., :vocab].float().gather(2, token.clamp(max=vocab - 1).unsqueeze(-1)).squeeze(-1)
+            credit.index_add_(0, (slots[code] + bucket).flatten(), (error * (token != pad)).flatten())
+        return credit
 
     def reassemble(self, site, error):
         """Weight gradient from output error and cached input."""
@@ -1023,6 +1182,9 @@ class Boost:
         self.shared_generator = self.capture.shared_generator
         self.generator = torch.Generator(self.device).manual_seed(seed + 17 + 1000 * sequence)
         self.maps = {}
+        self.soft = None  # (teacher distribution [b, t, V], lam) for a distilled Cut update, set by the training loop
+        self.covariances = {code: InputCovariance(settings.precondition_beta, settings.precondition_damping)
+                            for code in settings.precondition}  # restart with the estimator (a resume re-warms them)
 
     def close(self):
         self.capture.close()
@@ -1042,9 +1204,10 @@ class Boost:
     def basis(self):
         return hadamard(self.width, self.device, torch.float32) * self.signs(self.width)
 
-    def probe(self, x, y, mix=None, probed=None):
+    def probe(self, x, y, mix=None, probed=None, soft=None, logit_offset=None):
         """Each token's readout credit in the probed space, measured along a full cycle of the step's basis; the
-        GPUs of a sequence each take a slice of the cycle and add their parts."""
+        GPUs of a sequence each take a slice of the cycle and add their parts. soft (q (n, V), lam): against the
+        mixed target. logit_offset (n, V): the copy route's fixed addition to the raw logits."""
         weight = self.model.lm_head.weight.float()[:self.model.config.vocab_size]
         H = self.basis()
         stream_dirs = H.T if mix is None else mix.float() @ H.T
@@ -1061,8 +1224,10 @@ class Boost:
         per = max(1, self.s.chunk // ((hi - lo) * vocab))
         for t0 in range(0, n, per):
             xs, ys = x[t0:t0 + per], y[t0:t0 + per]
-            derivative = cycle_derivatives(xs @ weight.T, C, ys, steps[t0:t0 + per],
-                                           xs.square().sum(-1, keepdim=True), xs @ stream_dirs, dir_sq, self.width)
+            cycle = (xs @ weight.T, C, ys) if soft is None else (xs @ weight.T, C, ys, soft[0][t0:t0 + per], soft[1])
+            derivative = (cycle_derivatives if soft is None else mixed_cycle_derivatives)(
+                *cycle, steps[t0:t0 + per], xs.square().sum(-1, keepdim=True), xs @ stream_dirs, dir_sq, self.width,
+                None if logit_offset is None else logit_offset[t0:t0 + per])
             credit[t0:t0 + per] = derivative @ Hs / self.width
         return self.group_sum(credit)
 
@@ -1389,10 +1554,27 @@ class Boost:
         for name, p in params:
             p.grad = flat[offset:offset + p.numel()].view_as(p).to(p.dtype)
             offset += p.numel()
+        self.precondition()
         optimizer.step()
         self.maps.clear()
         loss = average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1))
         return loss if ASYNC_STEPS else loss.item()
+
+    def precondition(self):
+        """Settings.precondition: the all-reduced credits of the LM head and of the n-gram projections, each times
+        the inverse running covariance of the inputs this update's clean forward gave them."""
+        model, inputs = self.model, self.capture.inputs
+        sites = {'h': ('lm_head', [model.lm_head.weight]),
+                 'p': ('ngram_proj.0', [proj.weight for proj in model.ngram_proj.values()]
+                       if model.config.ngram_rows else [])}
+        for code, covariance in self.covariances.items():
+            site, weights = sites[code]
+            if not weights:
+                continue
+            covariance.update(inputs[site].flatten(0, 1))  # every projection reads the same summed rows
+            for weight in weights:
+                weight.grad = covariance.apply(weight.grad).to(weight.dtype)
+
 
 class Cut(Boost):
     """Own-query forward loss probes, optionally augmented by PR #23's value path."""
@@ -1544,12 +1726,13 @@ class Cut(Boost):
             credits.append(torch.stack([(credit*previous).sum(), (credit*x0).sum()]))
         return torch.stack(credits, dim=1)
 
-    def chain_credits(self, e, x0, mids, outs, routes, y):
+    def chain_credits(self, e, x0, mids, outs, routes, y, soft=None, offset=None):
         """Measure embedding and mid-stream credits from loss.
 
         Each root uses a full orthogonal cycle. Mixing scalars retain their
         central mid-stream probes. MLP outputs reuse the next mid credit;
         the final output uses the existing head probe.
+        soft (q (n, V), lam): the loss is measured against the mixed target.
         """
         model, s = self.model, self.s
         L = model.config.n_layer
@@ -1562,7 +1745,8 @@ class Cut(Boost):
         xL = outs[-1]
         base = xL @ weight.T
         target_w = weight[y.clamp(min=0)]
-        moments = head_moments(xL, base, weight) if s.head_moments else None
+        moments = head_moments(xL, base, weight, offset=offset) if s.head_moments else None
+        teacher_rows = None if soft is None else teacher_head_rows(xL, base, weight, soft[0], offset)
         n, m, h = e.shape[0], s.chain_tokens, s.scalar_step
         # Draw bases in the original site order. Replay one sequence at a time
         # so routed K/V storage does not grow with the per-GPU batch size.
@@ -1617,7 +1801,9 @@ class Cut(Boost):
                         site, move if move is not None else (steps[sl], H, extra), scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                         [r[1][sl] for r in routes], lam_r, lam_0, selected_fc, selected_out, weight_t,
                         base[sl], target_w[sl], y[sl], own_sl, packed=True,
-                        moments=None if moments is None else tuple(z[sl] for z in moments))
+                        moments=None if moments is None else tuple(z[sl] for z in moments),
+                        soft=None if soft is None else (soft[1], teacher_rows[0][sl], teacher_rows[1][sl]),
+                        offset=None if offset is None else offset[sl])
                     credit[sl] = derivative[:, :P] @ H / self.width
                     if site >= 0 and scalars_here:
                         lam += (derivative[:, P:P + 2] + derivative[:, P + 2:]).sum(0) / 2
@@ -1721,8 +1907,15 @@ class Cut(Boost):
         b, t = x.shape
         yf = y.flatten()
         gradients = {}
-        head = d.head_error()  # coordinate differences at the final readout
+        # A distilled update measures all three of its losses against the mixed target: the head's coordinate
+        # differences, the top stream's probe and the chain's readout.
+        soft = self.soft
+        soft_rows = None if soft is None else (soft[0].flatten(0, 1), soft[1])
+        head = d.head_error(soft=soft)  # coordinate differences at the final readout
         gradients['lm_head.weight'] = d.reassemble('lm_head', head)
+        offset = None if d.offset is None else d.offset.flatten(0, 1)
+        if offset is not None:
+            gradients['copy_gate'] = d.copy_credit(head)
         e = d.outputs['transformer.wte'].float().flatten(0, 1)
         x0 = norm(e)
         mids, outs, routes = [], [], []
@@ -1736,8 +1929,8 @@ class Cut(Boost):
             top = self.select_mlp_routes(i, mid, hpre, r)
             out = mid + F.linear(r, mlp.c_proj.weight.float())
             mids.append(mid), outs.append(out), routes.append((top, hpre.gather(1, top)))
-        g_top = self.probe(outs[-1], yf)  # the top stream's credit, through the head alone
-        chain = self.chain_credits(e, x0, mids, outs, routes, yf)
+        g_top = self.probe(outs[-1], yf, soft=soft_rows, logit_offset=offset)  # the top stream's credit, through the head alone
+        chain = self.chain_credits(e, x0, mids, outs, routes, yf, soft_rows, offset)
         lam_r = model.resid_lambdas.float()
         outputs = {i: g_top if i == L - 1 else lam_r[i + 1] * chain[i + 1] for i in range(L)}  # block output credits
         targets = {i: (chain[i] @ block.attn.c_proj.weight.float()).view(b, t, self.width)
@@ -1777,7 +1970,7 @@ class Cut(Boost):
             # internals split or average their own: keys share dims, queries share draws, hidden units share units)
             for name in list(gradients):
                 if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
-                        'transformer.wte.weight', 'resid_lambdas', 'x0_lambdas'):
+                        'transformer.wte.weight', 'resid_lambdas', 'x0_lambdas', 'copy_gate'):
                     gradients[name] = torch.zeros_like(gradients[name])
         if s.future_draws:
             # Use this capture's original measured hub targets, never corrected
@@ -2365,12 +2558,37 @@ def anvil_update(g, w, fast, slow, energy, beta, fast_beta, slow_beta, weight, l
     return w - lr * ratio * (update + decay)
 
 
-class BatchedAnvil(Anvil):
-    """ANVIL II from modded-nanogpt PR #360, applied to all same-shape matrices at once."""
+def head_polar(g, heads, margin=1.1):
+    """polar_batch taken per attention head: each matrix's `heads` row blocks orthogonalized on their own."""
+    count, rows, columns = g.shape
+    x = g.reshape(count * heads, rows // heads, columns)
+    if x.size(1) > x.size(2):
+        raise ValueError('Per-head polar needs wide head slices')
+    x = x / (margin * x.norm(dim=(1, 2), keepdim=True) + 1e-6)
+    return newton_schulz(x).float().reshape(count, rows, columns)
 
-    def __init__(self, *args, polar_margin=1.1, **kwargs):
+
+def anvil_update_heads(g, w, fast, slow, energy, beta, fast_beta, slow_beta, weight, lane_beta, lr, wd, lanes: int,
+                       ratio: float, margin: float, heads: int):
+    """anvil_update with the polar step taken per head (c_q / c_k: a head's rows only meet their own key or query)."""
+    fast.lerp_(g, 1 - fast_beta)
+    slow.lerp_(g, 1 - slow_beta)
+    update = head_polar(g.lerp(weight * fast + (1 - weight) * slow, beta), heads, margin)
+    energy.lerp_(update.square().mean(lanes + 1, keepdim=True), 1 - lane_beta)
+    gained = update * energy.clamp_min(1e-10).rsqrt()
+    update = gained * (update.norm(dim=(1, 2), keepdim=True) / gained.norm(dim=(1, 2), keepdim=True).clamp_min(1e-10))
+    decay = (slow * w >= 0) * w * (wd * lr)
+    return w - lr * ratio * (update + decay)
+
+
+class BatchedAnvil(Anvil):
+    """ANVIL II from modded-nanogpt PR #360, applied to all same-shape matrices at once. The matrices in
+    `head_matrices` (ids) form their own stacks and take the polar step per head (`heads` row blocks each)."""
+
+    def __init__(self, *args, polar_margin=1.1, head_matrices=frozenset(), heads=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.polar_margin, self.stacks = polar_margin, {}
+        self.head_matrices, self.heads = head_matrices, heads
 
     def load_state_dict(self, state_dict):
         # Cached stacks must be rebuilt from the freshly restored per-parameter state.
@@ -2408,13 +2626,14 @@ class BatchedAnvil(Anvil):
             lr, wd = group['lr'], group['weight_decay']
             by_shape = {}
             for p in group['params']:
-                by_shape.setdefault(tuple(p.shape), []).append(p)
-            for shape, params in by_shape.items():
+                by_shape.setdefault((tuple(p.shape), id(p) in self.head_matrices), []).append(p)
+            for (shape, per_head), params in by_shape.items():
                 stack = self.stacked_state(shape, params)
-                new = anvil_update(torch.stack([p.grad.float() for p in params]), torch.stack([p.float() for p in params]),
-                                   stack['fast'], stack['slow'], stack['energy'], value(beta), value(fast_beta),
-                                   value(self.slow_beta), value(weight), value(self.lane_beta), value(lr), value(wd),
-                                   1 if shape[0] >= shape[1] else 0, max(1, shape[0] / shape[1]) ** 0.5, self.polar_margin)
+                update = partial(anvil_update_heads, heads=self.heads) if per_head else anvil_update
+                new = update(torch.stack([p.grad.float() for p in params]), torch.stack([p.float() for p in params]),
+                             stack['fast'], stack['slow'], stack['energy'], value(beta), value(fast_beta),
+                             value(self.slow_beta), value(weight), value(self.lane_beta), value(lr), value(wd),
+                             1 if shape[0] >= shape[1] else 0, max(1, shape[0] / shape[1]) ** 0.5, self.polar_margin)
                 torch._foreach_copy_(params, list(new.to(params[0].dtype).unbind(0)))
         self.t += 1
 
@@ -2458,6 +2677,85 @@ def make_model(device, seed, config, projection_std, head_std=0.001):
     return model.requires_grad_(False)
 
 
+# Share of a planted head's logit carried by its first rotary frequencies (the track-1 record's profile); the other
+# frequencies share the rest evenly.
+PREV_PROFILE = (0.233, 0.138, 0.094, 0.076, 0.065, 0.047, 0.05, 0.049, 0.043, 0.021, 0.025, 0.041)
+PLANT_ROWS, PLANT_TOKENS = 4, 1024  # the held-out rows and tokens that give a planted head its input direction
+PLANT_SEED = 1000
+
+
+def previous_token_pair(head_dim, generator):
+    """A query q and key k of norm sqrt(head_dim) whose rotated, normalized logit peaks one token back: k is q
+    turned by one position, so the logit is sum_i p_i cos(theta_i (t - s - 1)) up to scale."""
+    half = head_dim // 2
+    profile = torch.full((half,), (1 - sum(PREV_PROFILE)) / (half - len(PREV_PROFILE)))
+    profile[:len(PREV_PROFILE)] = torch.tensor(PREV_PROFILE)
+    amplitude = (profile / profile.sum() * head_dim).sqrt()
+    theta = 1.0 / 10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)
+    phase = torch.rand(half, generator=generator) * 2 * math.pi
+    q1, q2 = amplitude * torch.cos(phase), amplitude * torch.sin(phase)
+    q = torch.cat([q1, q2])
+    k = torch.cat([torch.cos(theta) * q1 + torch.sin(theta) * q2, -torch.sin(theta) * q1 + torch.cos(theta) * q2])
+    return q, k
+
+
+@torch.no_grad()
+def attention_input(model, rows, block):
+    """The normalized stream entering one block's attention on the rows, (tokens, width)."""
+    seen = []
+    hook = model.transformer.h[block].attn.register_forward_pre_hook(lambda module, inputs: seen.append(inputs[0]))
+    try:
+        with torch.autocast(rows.device.type, dtype=torch.bfloat16, enabled=rows.device.type == 'cuda'):
+            model(rows)
+    finally:
+        hook.remove()
+    return seen[0].float().flatten(0, 1)
+
+
+@torch.no_grad()
+def plant_previous_token_heads(model, heads, rows, seed):
+    """Init only: each listed (block, head) becomes a content-free previous-token head. Its c_q / c_k rows are a
+    previous_token_pair applied to the block's mean input direction on the rows, so every token asks the same
+    question and the rotation alone picks the key. Several ranks take rank 0's tensors, so the replicas match."""
+    generator = torch.Generator().manual_seed(PLANT_SEED + seed)
+    planted = []
+    for block, head in sorted(heads):
+        attn = model.transformer.h[block].attn
+        direction = attention_input(model, rows, block).mean(0)
+        direction = direction / direction.norm()
+        own_rows = slice(head * attn.head_dim, (head + 1) * attn.head_dim)
+        for linear, vector in zip((attn.c_q, attn.c_k), previous_token_pair(attn.head_dim, generator)):
+            linear.weight[own_rows] = torch.outer(vector.to(direction.device), direction).to(linear.weight.dtype)
+            planted.append(linear.weight)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        for weight in planted:
+            torch.distributed.broadcast(weight, 0)
+
+
+class Teacher:
+    """The distillation teacher: an exponential mean of the model's weights, and its forward."""
+
+    def __init__(self, model, settings, device):
+        self.beta = settings.distill_beta
+        self.net = make_model(device, SEED, settings.model, settings.projection_std, settings.head_std)
+        self.net.load_state_dict(model.state_dict())
+        # A bf16 table can't hold a 1% step toward a nearby value, so those means are kept in fp32 and copied in.
+        self.means = [None if p.dtype == torch.float32 else p.float().clone() for p in self.net.parameters()]
+
+    @torch.no_grad()
+    def update(self, model):
+        for mean, own, new in zip(self.means, self.net.parameters(), model.parameters()):
+            if mean is None:
+                own.lerp_(new, 1 - self.beta)
+            else:
+                own.copy_(mean.lerp_(new.float(), 1 - self.beta))
+
+    @torch.no_grad()
+    def distribution(self, x):
+        with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=x.device.type == 'cuda'):
+            return torch.softmax(self.net(x).float(), -1)
+
+
 def make_optimizer(model, recipe, steps):
     """ANVIL II on block matrices, Adam elsewhere."""
     matrices, groups = [], {}
@@ -2468,14 +2766,17 @@ def make_optimizer(model, recipe, steps):
         scale = (recipe.emb_scale if ('wte' in name or 'value_embeds' in name)
                  else (recipe.ngram_scale or recipe.emb_scale) if 'ngram_embeds' in name
                  else recipe.ngram_proj_scale if 'ngram_proj' in name
-                 else recipe.lambda_scale if 'lambdas' in name else 1)
+                 else recipe.lambda_scale if 'lambdas' in name
+                 else recipe.copy_scale if name == 'copy_gate' else 1)
         groups.setdefault(scale, []).append(parameter)
     adam = torch.optim.AdamW(
         [{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
         betas=recipe.betas, eps=1e-8, weight_decay=0.0,
     )
-    anvil = BatchedAnvil(matrices, recipe.anvil_lr, recipe.anvil_wd, steps,
-                         polar_margin=recipe.polar_margin, fast_weight=recipe.fast_weight)
+    head_matrices = frozenset(id(getattr(block.attn, f'c_{m}').weight)
+                              for block in model.transformer.h for m in recipe.anvil_head_polar)
+    anvil = BatchedAnvil(matrices, recipe.anvil_lr, recipe.anvil_wd, steps, polar_margin=recipe.polar_margin,
+                         fast_weight=recipe.fast_weight, head_matrices=head_matrices, heads=model.config.n_head)
     return Optimizers(anvil, adam)
 
 
@@ -2592,6 +2893,27 @@ def holdout_loss(model, rows, rank, world):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(total)
     return (total[0] / total[1]).item()
+
+
+@torch.no_grad()
+def search_step(model, before, multipliers, rows, rank, world):
+    """Settings.step_search: the update just applied moved the weights from `before`; try each multiple of that
+    move by one forward on the held-out rows and leave the weights at the best. Returns the multiplier kept.
+
+    The loss is summed over the ranks, so every replica takes the same decision."""
+    after = [p.detach().clone() for p in model.parameters()]
+
+    def place(multiplier):
+        for p, old, new in zip(model.parameters(), before, after):
+            p.copy_(new if multiplier == 1 else torch.lerp(old.float(), new.float(), multiplier).to(p.dtype))
+
+    losses = {}
+    for multiplier in multipliers:
+        place(multiplier)
+        losses[multiplier] = holdout_loss(model, rows, rank, world)
+    best = min(losses, key=losses.get)
+    place(best)
+    return best
 
 
 def merge_part(name):
@@ -2806,12 +3128,18 @@ def train_stages(args, settings, device, rank, world):
         size = settings.cut_batch if phase == 'cut' else settings.boost_batch
         batch = rank_slice(noise[:size], phase)
         estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+        if settings.distill and phase == 'cut':  # the mixed-target kernels too, against any distribution
+            random_logits = torch.randn(*batch[:, 1:].shape, settings.model.vocab_size, device=device)
+            estimator.soft = (torch.softmax(random_logits, -1), settings.distill_lam)
+            estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
         estimator.close()
         del model, optimizer, estimator
     torch.cuda.empty_cache()
 
     completed, previous_seconds = 0, 0.
     phase = schedule[0][0]
+    if args.resume and settings.distill:  # the teacher's mean is not in the checkpoint
+        raise ValueError('A distilled run cannot resume: its teacher starts at the first update')
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
         completed = checkpoint['step']
@@ -2824,6 +3152,12 @@ def train_stages(args, settings, device, rank, world):
         phase = saved_phase
         del checkpoint
     model = make_model(device, SEED, settings.model, settings.projection_std, settings.head_std)
+    if settings.plant and not args.resume:
+        plant_previous_token_heads(model, planted_heads(settings.plant),
+                                   holdout_rows[:PLANT_ROWS, :PLANT_TOKENS].to(device), SEED)
+    teacher = Teacher(model, settings, device) if settings.distill else None
+    if settings.step_search and not HOLDOUT:
+        raise ValueError('The step search scores its candidates on the held-out rows: --holdout must be positive')
     optimizer, estimator = make_optimizer(model, settings, phases[phase]), estimator_for(model, phase)
     if args.resume:
         completed, previous_seconds = restore_training_state(args.resume, model, optimizer, estimator, recipe=recipe_state)
@@ -2848,7 +3182,16 @@ def train_stages(args, settings, device, rank, world):
                 optimizer, estimator, phase = next_optimizer, estimator_for(model, current), current
             batch = rank_slice(training[begin:end], phase)
             set_rate(optimizer, phase_step, horizon, settings.warmdown, settings.final)
+            distilled = teacher is not None and phase == 'cut' and begin / len(training) >= settings.distill_start
+            estimator.soft = ((teacher.distribution(batch[:, :-1].contiguous()), settings.distill_lam)
+                              if distilled else None)
+            before = [p.detach().clone() for p in model.parameters()] if settings.step_search else None
             loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+            step_scale = (search_step(model, before, settings.step_search, holdout_rows, rank, world)
+                          if settings.step_search else None)
+            del before
+            if teacher is not None:
+                teacher.update(model)
             evaluating = bool(args.eval_every and step % args.eval_every == 0 and step < steps)
             if args.async_steps:  # queue updates without host round trips; report every ASYNC_LOG updates
                 pending_losses.append(loss)
@@ -2871,6 +3214,8 @@ def train_stages(args, settings, device, rank, world):
             record = dict(step=step, phase=phase, phase_step=phase_step, seqs=end,
                           tokens=end*settings.model.sequence_len, train_loss=loss, train_seconds=round(elapsed, 2),
                           peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3))
+            if step_scale is not None:
+                record['step_scale'] = step_scale
             if evaluating:
                 pause = time.perf_counter()
                 record['val_loss'] = evaluate(model.state_dict(), args.data_dir, model_file=MODEL_FILE)
