@@ -1,6 +1,7 @@
 """Track 3's model: the Dust GPT at 12 blocks of width 1024 (16 heads of 64), a value embedding on every block, and
 hashed bigram, trigram and skip-bigram tables (2^20 rows x 128 each) summed and projected into every block's value
-embedding (613.9M parameters). GPTConfig()'s defaults are this architecture: utils/eval.py builds it that way.
+embedding (613.9M parameters). A calibrated causal cache mixes the neural prediction with continuations from the
+current input prefix. GPTConfig()'s defaults are this architecture: utils/eval.py builds it that way.
 """
 from dataclasses import dataclass
 from functools import cache
@@ -56,9 +57,45 @@ def ngram_index(idx, code, rows, pad):
     the token and the tokens at those lags; `pad` before the start."""
     ids = idx
     for k in NGRAM_SKIPS.get(code) or range(1, int(code)):
-        ids = ids * (pad + 1) + F.pad(idx[:, :-k], (k, 0), value=pad)
+        ids = ids * (pad + 1) + F.pad(idx, (k, 0), value=pad)[:, :idx.size(1)]
     h = ids * 2654435761  # wraps in int64 for long n-grams: still a fixed hash
     return (h ^ (h >> 29)).remainder(rows)
+
+
+CACHE_ORDER = 4
+CACHE_BINS = 1 + 3 * CACHE_ORDER
+
+
+def cache_matches(idx):
+    """Yield a query slice, a mask over continuation tokens, their count, and a calibration bin.
+
+    At query q the candidate token idx[v] has already been seen (v <= q). For order k its
+    preceding k tokens must equal the k tokens ending at q. Use the longest matching order
+    up to CACHE_ORDER, backing off to the empirical unigram distribution of idx[:q+1].
+    """
+    batch, length = idx.shape
+    positions = torch.arange(length, device=idx.device)
+    padded = F.pad(idx, (CACHE_ORDER, 0), value=-1)
+    for start in range(0, length, 64):
+        stop = min(start + 64, length)
+        pos = slice(start, stop)
+        eligible = positions[None, :] <= positions[pos, None]
+        selected = eligible.expand(batch, -1, -1)
+        matched = selected
+        order = torch.zeros((batch, stop - start), dtype=torch.long, device=idx.device)
+        for k in range(1, CACHE_ORDER + 1):
+            offset = CACHE_ORDER - k
+            query = padded[:, offset + start + 1:offset + stop + 1]
+            source = padded[:, offset:offset + length]
+            matched = matched & (positions >= k) & (query.unsqueeze(-1) == source.unsqueeze(1))
+            found = matched.any(dim=-1)
+            selected = torch.where(found.unsqueeze(-1), matched, selected)
+            order = order + found.long()
+        support = selected.sum(dim=-1)
+        # Bin zero is the unigram fallback. Each positive order has bins for 1, 2–3, or 4+ matches.
+        bucket = (support >= 2).long() + (support >= 4).long()
+        bins = torch.where(order == 0, 0, 1 + 3 * (order - 1) + bucket)
+        yield pos, selected, support, bins
 
 
 def norm(x):
@@ -142,6 +179,7 @@ class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
         self.config = config
+        self.register_buffer('cache_weights', torch.zeros(CACHE_BINS, dtype=torch.float32))
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab = (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to * pad_vocab_size_to
         self.transformer = nn.ModuleDict({
@@ -171,6 +209,7 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
+        self.cache_weights.zero_()
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3 ** 0.5 * self.config.n_embd ** (-0.5)
@@ -220,8 +259,8 @@ class GPT(nn.Module):
         sizes[-1] = (long_w, 0)
         return sizes
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
-        B, T = idx.size()
+    def neural_logits(self, idx):
+        T = idx.size(1)
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
         x = norm(self.transformer.wte(idx))
         x0 = x
@@ -237,10 +276,45 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)  # soft cap
+        return 15 * torch.tanh(logits / 15)  # soft cap
+
+    def cache_observations(self, idx, logits, targets):
+        """Return the two experts' target probabilities and bin per position for forward-only calibration."""
+        base_probs, cache_probs, bin_ids = [], [], []
+        for pos, selected, support, bins in cache_matches(idx):
+            labels = targets[:, pos]
+            ignored = labels == -1
+            scores = logits[:, pos]
+            chosen = scores.gather(-1, labels.masked_fill(ignored, 0).long().unsqueeze(-1)).squeeze(-1)
+            base_prob = (chosen - scores.logsumexp(dim=-1)).exp()
+            hits = (selected & (idx.unsqueeze(1) == labels.unsqueeze(-1))).sum(dim=-1)
+            base_probs.append(base_prob.masked_fill(ignored, 1.0))
+            cache_probs.append((hits / support).masked_fill(ignored, 1.0))
+            bin_ids.append(bins)
+        return torch.cat(base_probs, 1), torch.cat(cache_probs, 1), torch.cat(bin_ids, 1)
+
+    def forward(self, idx, targets=None, loss_reduction='mean'):
+        logits = self.neural_logits(idx)
+        weights = self.cache_weights.clamp(0, 1 - torch.finfo(torch.float32).eps)
         if targets is not None:
-            return F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1),
-                ignore_index=-1, reduction=loss_reduction,
-            )
-        return logits
+            base_prob, cache_prob, bins = self.cache_observations(idx, logits, targets)
+            w = weights[bins]
+            losses = -((1 - w) * base_prob + w * cache_prob).log()
+            if loss_reduction == 'none':
+                return losses.reshape(-1)
+            if loss_reduction == 'sum':
+                return losses.sum()
+            if loss_reduction == 'mean':
+                return losses.sum() / (targets != -1).sum()
+            raise ValueError(f'Unknown loss reduction {loss_reduction!r}')
+
+        log_probs = torch.empty_like(logits)
+        token_ids = idx.long().unsqueeze(1)
+        for pos, selected, support, bins in cache_matches(idx):
+            w = weights[bins].unsqueeze(-1)
+            counts = torch.zeros_like(logits[:, pos], dtype=torch.int32)
+            counts.scatter_add_(-1, token_ids.expand_as(selected), selected.int())
+            cache_prob = counts / support.unsqueeze(-1)
+            probs = (1 - w) * logits[:, pos].softmax(dim=-1) + w * cache_prob
+            log_probs[:, pos] = probs.log()
+        return log_probs

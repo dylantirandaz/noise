@@ -1,5 +1,5 @@
 """Track 3 (open architecture): Cut-lite over the whole epoch on a 12 x 1024 transformer whose value embeddings
-read hashed bigram, trigram and skip-bigram tables, then the end merge.
+read hashed bigram, trigram and skip-bigram tables, followed by an end merge and a causal continuation cache.
 
 The model is model.py's GPTConfig() (what utils/eval.py builds): 12 blocks at width 1024 (16 heads of 64), a value
 embedding on every block, and three hashed n-gram tables of 2^20 rows x 128, indexed by (previous token, token),
@@ -15,10 +15,11 @@ Training (every signal measured forward against the loss, at most one step throu
     value error (they enter the values linearly).
   - ANVIL II on the block matrices, Adam elsewhere (x750 on the embedding and n-gram tables, x15 on the residual
     scalars), a warmdown over the last 60% of the updates.
-  - The end merge along the trajectory, scored on the last 64 training sequences (which feed no update).
+  - The end merge along the trajectory, scored on the last 64 shuffled training sequences.
+  - On 32 separate training sequences, choose each suffix bin's cache weight by forward loss on a fixed grid.
+    Report the resulting paired change on another 32 training sequences. Neither slice is used for the backbone.
+    The result's steps, seqs and tokens count backbone updates; cache fitting, merge and audit rows are listed separately.
   - The chain reruns use the track-2 record's exact speedups (bf16 moves, readout moments, fused query, norm fold).
-
-Every switch is a Settings field (or a flag below) with the record's value as its default.
 
     uv run torchrun --standalone --nproc_per_node=8 train/arch/run.py
 """
@@ -984,7 +985,7 @@ class Capture:
         self.capturing = True
         try:
             with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == 'cuda'):
-                self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
+                self.clean_loss = neural_loss(self.model, x, y, 'none').view_as(y).float()
         finally:
             self.capturing = False
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == 'cuda'):
@@ -2569,9 +2570,14 @@ def handoff_optimizer(old, new, phase_step):
     new.optimizers[0].t = phase_step - 1
 
 
+def neural_loss(model, x, y, reduction):
+    logits = model.neural_logits(x)
+    return F.cross_entropy(logits.flatten(0, 1), y.reshape(-1), ignore_index=-1, reduction=reduction)
+
+
 def holdout_sum(model, x, y):
     with torch.autocast('cuda', dtype=torch.bfloat16):
-        return model(x, y, loss_reduction='sum')
+        return neural_loss(model, x, y, 'sum')
 
 
 holdout_sum_graphed = torch.compile(holdout_sum, mode='reduce-overhead', dynamic=False)
@@ -2584,8 +2590,9 @@ def holdout_loss(model, rows, rank, world):
     total = torch.zeros(2, dtype=torch.float64, device=device)
     forward = holdout_sum_graphed if MERGE_GRAPH else holdout_sum
     with torch.no_grad():
-        for batch in rows[rank::world].split(8):
-            batch = batch.to(device)
+        local_rows = rows[rank::world]
+        for start in range(0, len(local_rows), 8):
+            batch = local_rows[start:start + 8].to(device)
             loss = forward(model, batch[:, :-1].contiguous(), batch[:, 1:].contiguous())
             total[0] += loss.double()
             total[1] += batch[:, 1:].numel()
@@ -2600,7 +2607,9 @@ def merge_part(name):
     return 've_gates' if 've_gate' in name else name
 
 
-HOLDOUT = 64  # training sequences that feed no update and score the end merge
+HOLDOUT = 64  # training sequences reserved for the end merge
+CACHE_FIT_ROWS, CACHE_AUDIT_ROWS = 32, 32
+CACHE_GRID = (0., .01, .025, .05, .1, .2, .35, .5, .65, .8, .9, .97)
 MERGE_FROM, MERGE_EVERY = 0.6, 5  # the exponential means follow the weights from 60% of the epoch, every 5 updates
 MERGE_DECAYS = (0.5, 0.3, 0.2, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01)  # weight of the newest weights in each mean
 MERGE_RHOS = (0.0, 0.5, 1.0)  # how far a candidate moves outside the high-curvature subspace
@@ -2628,7 +2637,7 @@ def curvature_bases(model, rows, rank, world, k=MERGE_K):
         for batch in rows.split(4):
             batch = batch.to(device)
             with torch.autocast('cuda', dtype=torch.bfloat16):
-                model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
+                model.neural_logits(batch[:, :-1].contiguous())
             counts += torch.bincount(batch[:, :-1].reshape(-1).long(), minlength=len(counts)).double()
         for h in hooks:
             h.remove()
@@ -2744,13 +2753,40 @@ def end_merge(model, means, rows, rank, world):
                        first_keys=MERGE_FIRST_KEYS)
 
 
+@torch.no_grad()
+def cache_losses(model, rows, weights, rank, world):
+    """For each bin, sum forward losses for its column(s) of candidate weights on these training rows."""
+    device = weights.device
+    totals = torch.zeros_like(weights, dtype=torch.float64)
+    counts = torch.zeros(len(weights), device=device, dtype=torch.int64)
+    for row in rows[rank::world]:
+        batch = row.to(device).unsqueeze(0)
+        x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == 'cuda'):
+            logits = model.neural_logits(x)
+        base, cache, bins = model.cache_observations(x, logits, y)
+        bins = bins.reshape(-1)
+        w = weights[bins]
+        probability = (1 - w) * base.reshape(-1, 1) + w * cache.reshape(-1, 1)
+        totals.index_add_(0, bins, -probability.log())
+        counts.index_add_(0, bins, torch.ones_like(bins))
+    if world > 1:
+        torch.distributed.all_reduce(totals)
+        torch.distributed.all_reduce(counts)
+    if not totals.isfinite().all().item():
+        raise FloatingPointError('Non-finite continuation-cache loss')
+    return totals, counts
+
+
 def train_stages(args, settings, device, rank, world):
     """Boost -> own-query Cut; each row is consumed exactly once, including across resume."""
     if world not in (1, 2, 4, 8):
         raise ValueError('Stage training supports 1, 2, 4 or 8 GPUs')
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
-    holdout_rows, training = training[-HOLDOUT:], training[:-HOLDOUT]  # these feed no update, only the end merge
+    update_rows = len(training) - HOLDOUT - CACHE_FIT_ROWS - CACHE_AUDIT_ROWS
+    training, cache_fit, cache_audit, holdout_rows = training.split(
+        (update_rows, CACHE_FIT_ROWS, CACHE_AUDIT_ROWS, HOLDOUT))
     if args.rows:  # a prefix of the shuffled epoch; the schedule follows its length
         training = training[:args.rows]
     means = None  # the exponential means of the end merge, one per MERGE_DECAYS entry
@@ -2769,7 +2805,8 @@ def train_stages(args, settings, device, rank, world):
         [torch.distributed.new_group(list(range(i, i+cut_split))) for i in range(0, world, cut_split)]
         if cut_split > 1 else [None])
     cut_group = cut_groups[rank // cut_split] if cut_split > 1 else None
-    recipe_state = asdict(settings)
+    row_counts = dict(merge_rows=HOLDOUT, cache_fit_rows=len(cache_fit), cache_audit_rows=len(cache_audit))
+    recipe_state = {**asdict(settings), **row_counts, 'cache_grid': CACHE_GRID}
     if rank == 0:
         if args.output.exists() and any(args.output.iterdir()):
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
@@ -2777,10 +2814,10 @@ def train_stages(args, settings, device, rank, world):
         (args.output / 'config.json').write_text(json.dumps(dict(
             script=__file__, world=world, seed=SEED, recipe=recipe_state, steps=steps,
             epoch_updates=len(schedule), train_rows=len(training),
-            upstream='qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259',
+            upstream='qlabs-eng/noise@561c1f1d54284dfcb344960eba4d26c6d631035b',
             additions=['linear_path_scalars', 'input_key_probes', 'input_gate_probes',
                        'independent_future_hidden_query_embedding_probes', 'cut_batch4_split2', 'recipe_11',
-                       'end_merge'],
+                       'end_merge', 'causal_continuation_cache'],
             resume=str(args.resume.resolve()) if args.resume else None, torch_version=torch.__version__,
         ), indent=2)+'\n')
 
@@ -2853,7 +2890,7 @@ def train_stages(args, settings, device, rank, world):
             if args.async_steps:  # queue updates without host round trips; report every ASYNC_LOG updates
                 pending_losses.append(loss)
                 if not (evaluating or step % ASYNC_LOG == 0 or step == stop):
-                    if (step % MERGE_EVERY == 0 or step == stop) and begin / len(training) >= MERGE_FROM:
+                    if HOLDOUT and (step % MERGE_EVERY == 0 or step == stop) and begin / len(training) >= MERGE_FROM:
                         with torch.no_grad():
                             if means is None:
                                 means = [[q.detach().float().clone() for q in model.parameters()] for _ in MERGE_DECAYS]
@@ -2878,7 +2915,7 @@ def train_stages(args, settings, device, rank, world):
             if rank == 0:
                 print(json.dumps(record), flush=True)
                 log.write(json.dumps(record)+'\n'); log.flush()
-            if (step % MERGE_EVERY == 0 or step == stop) and begin / len(training) >= MERGE_FROM:
+            if HOLDOUT and (step % MERGE_EVERY == 0 or step == stop) and begin / len(training) >= MERGE_FROM:
                 with torch.no_grad():  # a resumed run restarts the means at its resumed weights
                     if means is None:
                         means = [[q.detach().float().clone() for q in model.parameters()] for _ in MERGE_DECAYS]
@@ -2898,19 +2935,40 @@ def train_stages(args, settings, device, rank, world):
                     train_seconds=elapsed, checkpoint=str((args.output/'checkpoint.pt').resolve())), indent=2)+'\n')
             return
         extra = {}
+        plain = None
         if means:  # the end merge, timed with the training (the plain weights' validation is not)
             plain = {name: value.detach().cpu() for name, value in model.state_dict().items()}
-            pause = time.perf_counter()
-            extra['val_loss_plain'] = evaluate(plain, args.data_dir, model_file=MODEL_FILE)
-            paused += time.perf_counter()-pause
+            if args.eval_every:
+                pause = time.perf_counter()
+                extra['val_loss_plain'] = evaluate(plain, args.data_dir, model_file=MODEL_FILE)
+                paused += time.perf_counter()-pause
             merge_start = time.perf_counter()
             extra.update(end_merge(model, means, holdout_rows, rank, world))
             torch.cuda.synchronize()
             extra['merge_seconds'] = round(time.perf_counter()-merge_start, 2)
-            elapsed = previous_seconds + time.perf_counter()-start-paused
-            if rank == 0:
-                torch.save(plain, args.output/'final_plain.pt')
             means = None
+        # One joint update from the cache-fit slice. The ascending grid keeps zero for an unseen bin
+        # and takes the smaller weight on a tie. All ranks see the same globally summed losses.
+        fit_start = time.perf_counter()
+        grid = torch.tensor(CACHE_GRID, dtype=torch.float64, device=device)
+        fit_losses, fit_counts = cache_losses(model, cache_fit, grid.expand(len(model.cache_weights), -1), rank, world)
+        model.cache_weights.copy_(grid[fit_losses.argmin(dim=1)])
+        torch.cuda.synchronize()
+        fit_end = time.perf_counter()
+        elapsed = previous_seconds + fit_end - start - paused
+        if rank == 0 and plain is not None:
+            torch.save(plain, args.output/'final_plain.pt')
+        del plain
+        # Both audit columns score the same frozen backbone. These rows never set a weight.
+        weights = model.cache_weights.double()
+        audit_weights = torch.stack((torch.zeros_like(weights), weights), dim=1)
+        audit_losses, audit_counts = cache_losses(model, cache_audit, audit_weights, rank, world)
+        audit_base, audit_mixed = (audit_losses.sum(0) / audit_counts.sum()).tolist()
+        extra.update(**row_counts, cache_fit_updates=1, cache_fit_tokens=len(cache_fit) * settings.model.sequence_len,
+                     cache_fit_seconds=round(fit_end - fit_start, 3),
+                     cache_weights=weights.tolist(), cache_fit_bin_counts=fit_counts.tolist(),
+                     cache_audit_neural_loss=audit_base, cache_audit_mixed_loss=audit_mixed,
+                     cache_audit_gain=audit_base - audit_mixed)
         state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
         result = dict(val_loss=evaluate(state, args.data_dir, model_file=MODEL_FILE), train_seconds=round(elapsed, 2), steps=stop,
                       seqs=end, tokens=end*settings.model.sequence_len, estimator=settings.estimator,
@@ -2950,7 +3008,7 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/arch'))
     parser.add_argument('--checkpoint-every', type=int, default=0)
-    parser.add_argument('--eval-every', type=int, default=125)  # the record's untimed validations
+    parser.add_argument('--eval-every', type=int, default=0, help='Optional untimed validation during training.')
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--stop-after-step', type=int)
     parser.add_argument('--steps', type=int, help='Diagnostic prefix; preserves the full-epoch LR schedule.')
@@ -2971,8 +3029,11 @@ def main():
     parser.add_argument('--holdout', type=int, default=HOLDOUT, help='Training rows held out to score the end merge.')
     args = parser.parse_args()
     HOLDOUT = args.holdout
-    if args.rows is not None and not 0 < args.rows <= TRAIN_ROWS - HOLDOUT:
-        parser.error('rows must be in 1..TRAIN_ROWS - HOLDOUT')
+    max_rows = TRAIN_ROWS - HOLDOUT - CACHE_FIT_ROWS - CACHE_AUDIT_ROWS
+    if HOLDOUT < 0 or max_rows <= 0:
+        parser.error('holdout must be nonnegative and leave training rows after the cache splits')
+    if args.rows is not None and not 0 < args.rows <= max_rows:
+        parser.error(f'rows must be in 1..{max_rows} after the holdout and cache splits')
     for key in ('steps', 'stop_after_step'):
         if getattr(args, key) is not None and getattr(args, key) < 1:
             parser.error(key + ' must be positive')
